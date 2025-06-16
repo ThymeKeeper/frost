@@ -64,6 +64,6 @@ A blazingly fast, lightweight, Terminal User Interface (TUI) SQL IDE for Snowfla
 - This has only been tested in Windows Terminal, though there is some untested Ubuntu support built in.
 
 ### Current punchlist:
-- Remove console print statements that litter the TUI during DB refresh
-- Add autocomplete feature
+- Remove console print statements that litter the TUI during DB refresh and on snowflake connection
+- Add context awareness to autocomplete feature
 - Add more buffer motions
