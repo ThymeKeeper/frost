@@ -28,6 +28,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use batch_mode::{BatchConfig, OutputFormat};
+use editor::normalize_text_for_terminal;
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE},
@@ -296,8 +297,7 @@ fn run_interactive_mode(config: crate::config::Config, file_arg: Option<PathBuf>
         };
 
         let (lock, text) = crate::locked_file::LockedFile::open_exclusive(&load_path)?;
-        workspace.editor.buffer = text.replace("\r\n", "\n");
-        workspace.editor.buffer = text;
+        workspace.editor.buffer = normalize_text_for_terminal(&text);
         workspace.editor.caret  = 0;
         workspace.editor.clear_sel();
         workspace.file_lock     = Some(lock);

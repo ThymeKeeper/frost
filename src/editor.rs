@@ -39,6 +39,68 @@ struct EditGroup {
     caret_after: usize,
 }
 
+/// Normalize text for terminal display by replacing problematic characters
+pub fn normalize_text_for_terminal(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    
+    for ch in text.chars() {
+        match ch {
+            // Tab → 4 spaces
+            '\t' => result.push_str("    "),
+            
+            // Carriage return → skip (handle CRLF → LF)
+            '\r' => continue,
+            
+            // Non-breaking space → regular space
+            '\u{00A0}' => result.push(' '),
+            
+            // Zero-width characters → skip
+            '\u{200B}' | // Zero-width space
+            '\u{200C}' | // Zero-width non-joiner
+            '\u{200D}' | // Zero-width joiner
+            '\u{FEFF}' | // Zero-width no-break space (BOM)
+            '\u{2060}' => continue, // Word joiner
+            
+            // Other Unicode spaces → regular space
+            '\u{2000}'..='\u{200A}' | // Various Unicode spaces (en space, em space, etc.)
+            '\u{202F}' | // Narrow no-break space
+            '\u{205F}' | // Medium mathematical space
+            '\u{3000}' => result.push(' '), // Ideographic space
+            
+            // Control characters (except newline) → skip or replace
+            '\x00'..='\x08' | '\x0B'..='\x0C' | '\x0E'..='\x1F' | '\x7F' => {
+                // Skip most control characters
+                continue;
+            }
+            
+            // Soft hyphen → skip
+            '\u{00AD}' => continue,
+            
+            // Bidirectional text marks → skip (can cause terminal issues)
+            '\u{200E}' | // Left-to-right mark
+            '\u{200F}' | // Right-to-left mark
+            '\u{202A}'..='\u{202E}' | // Directional formatting
+            '\u{2066}'..='\u{2069}' => continue,
+            
+            // Emoji variation selectors → skip
+            '\u{FE00}'..='\u{FE0F}' => continue,
+            
+            // Private use areas → replace with placeholder
+            '\u{E000}'..='\u{F8FF}' | // BMP private use
+            '\u{F0000}'..='\u{FFFFD}' | // Plane 15 private use
+            '\u{100000}'..='\u{10FFFD}' => { // Plane 16 private use
+                result.push('�');
+                continue;
+            }
+            
+            // Normal characters and newlines → keep as-is
+            _ => result.push(ch),
+        }
+    }
+    
+    result
+}
+
 impl EditGroup {
     fn new(caret: usize, selection: Option<(usize, usize)>) -> Self {
         Self {
@@ -858,7 +920,7 @@ impl Editor {
                     }
                 }
 
-                clip = clip.replace("\r\n", "\n");
+                clip = normalize_text_for_terminal(&clip);
 
                 // 3️⃣  If it's ONLY whitespace, strip CR/LF but keep spaces/tabs
                 if clip.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) {
@@ -904,7 +966,8 @@ impl Editor {
                 if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
             {
                 self.checkpoint(LastAction::Typing);
-                self.insert(&ch.to_string());
+                let normalized = normalize_text_for_terminal(&ch.to_string());
+                self.insert(&normalized);
                 self.clear_sel();
                 self.preferred_col = self.caret_line_col().1;
 
@@ -1241,7 +1304,7 @@ impl Editor {
         if clip.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) {
             clip.retain(|c| matches!(c, ' ' | '\t'));
         }
-        clip = clip.replace("\r\n", "\n");
+        clip = normalize_text_for_terminal(&clip);
         if clip.is_empty() { return; }   // nothing left → bail
 
         // For bracketed paste, use the same delta approach
@@ -1480,6 +1543,8 @@ impl Editor {
 
 
     pub fn insert(&mut self, s: &str) {
+        // Normalize the input text
+        let normalized = normalize_text_for_terminal(s);
         self.erase_selection();
         self.dirty = true;
         
@@ -1488,8 +1553,8 @@ impl Editor {
             self.start_group();
         }
         
-        self.insert_at(self.caret, s);
-        self.caret += s.len();
+        self.insert_at(self.caret, &normalized);
+        self.caret += normalized.len();
         self.clear_sel();
     }
     
