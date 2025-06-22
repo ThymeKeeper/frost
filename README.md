@@ -40,11 +40,11 @@ A fast, lightweight, Terminal User Interface (TUI) SQL IDE for Snowflake, built 
 
 ## Screenshots
 
-![sc1](https://github.com/user-attachments/assets/32b4c1bb-011d-45ce-9c39-1abbb62e08a9)
+![sc1](https://github.com/user-attachments/assets/07ded057-5548-4f29-bd12-916440093185)
 
-![sc2](https://github.com/user-attachments/assets/45bc3961-9f3b-4c5b-ab08-db167002e482)
+![sc2](https://github.com/user-attachments/assets/308a5b4c-2464-4867-babf-23c62889559c)
 
-![sc3](https://github.com/user-attachments/assets/7a76632a-05d3-43d2-baf4-abee588efef3)
+![sc3](https://github.com/user-attachments/assets/5e6ea728-7c42-4b7c-9c61-3c202c22bb9d)
 
 ### Notes
 - This is a personal project; it's rough around the edges, but i'll be polishing it and adding features over time.
