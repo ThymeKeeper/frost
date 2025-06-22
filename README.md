@@ -1,6 +1,6 @@
 # ❄️ Frost
 
-A blazingly fast, lightweight, Terminal User Interface (TUI) SQL IDE for Snowflake, built with Rust. Navigate your data warehouse, execute queries, and analyze results - all from the comfort of your terminal.
+A fast, lightweight, Terminal User Interface (TUI) SQL IDE for Snowflake, built with Rust. Navigate your data warehouse, execute queries, and analyze results - all from the comfort of your terminal.
 
 ### Core Functionality
 - **Full SQL Editor** with syntax highlighting, find/replace, and bracket matching
