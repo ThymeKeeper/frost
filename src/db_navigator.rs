@@ -121,6 +121,11 @@ impl DbNavigator {
         Ok(self.cache.as_ref().unwrap().clone())
     }
 
+    pub fn set_connected(&mut self, connected: bool) {
+        // Store connection status if needed
+        // For now, we'll check this in the request_refresh method
+    }
+
     pub fn clear_cache(&mut self) {
         self.cache = None;
     }

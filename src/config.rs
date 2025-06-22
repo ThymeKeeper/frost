@@ -147,6 +147,10 @@ impl Config {
         
         if !config_path.exists() {
             Self::create_default_config(&config_path)?;
+            return Err(anyhow::anyhow!(
+                "Created config file at: {}. Please edit it with your Snowflake connection details.", 
+                config_path.display()
+            ));
         }
         
         let contents = fs::read_to_string(&config_path)?;
@@ -233,8 +237,6 @@ syntax_variable = [230, 195, 132]       # Variables and parameters
 syntax_plain = [200, 200, 200]          # Plain text
 "#;
         fs::write(path, default_toml)?;
-        eprintln!("Created config file at: {}", path.display());
-        eprintln!("Please edit it with your Snowflake connection details and restart.");
-        std::process::exit(1);
+        Ok(())
     }
 }

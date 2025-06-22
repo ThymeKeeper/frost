@@ -177,33 +177,14 @@ fn set_console_title(title: &str) {
 
 /*──────────────────────── main ────────────────────────────────*/
 fn main() -> anyhow::Result<()> {
-    // Set Snowflake logging environment variables first thing
-    std::env::set_var("SNOWFLAKE_LOG_LEVEL", "0"); // 0 = no logging
-    std::env::set_var("SNOWFLAKE_LOG_TRACE", "0");
-    std::env::set_var("SNOWFLAKE_DRIVER_LOG_LEVEL", "0");
-    std::env::set_var("SNOWSQL_PWD", ""); // Sometimes helps with auth messages
-    std::env::set_var("CLIENT_OUT_OF_BAND_TELEMETRY_ENABLED", "false");
-    
-    // Additional suppression via JSON config
-    let config_content = r#"{
-        "common": {
-            "log_level": "OFF",
-            "log_path": null
-        }
-    }"#;
-    
-    // Create config file in temp directory
-    let config_path = std::env::temp_dir().join("sf_client_config.json");
-    std::fs::write(&config_path, config_content).ok();
-    std::env::set_var("SF_CLIENT_CONFIG_FILE", config_path.to_str().unwrap());
-    
     let cli = Cli::parse();
 
     /* Load configuration */
-    let config = crate::config::Config::load()?;
+    let config_result = crate::config::Config::load();
     
     // Handle batch mode
     if let Some(Commands::Batch { sql_file, output_dir, format, exit_on_error, verbose, last_query_only }) = cli.command {
+        let config = config_result?; // For batch mode, we need valid config
         let output_format = match format.as_str() {
             "json" => OutputFormat::Json,
             "txt" | "text" => OutputFormat::Text,
@@ -224,11 +205,23 @@ fn main() -> anyhow::Result<()> {
         return batch_mode::run_batch_mode(batch_config);
     }
     
-    // Interactive mode
-    run_interactive_mode(config, cli.file)
+    // Interactive mode - handle config error gracefully
+    let (config, config_error) = match config_result {
+        Ok(cfg) => (cfg, None),
+        Err(e) => {
+            // Create a default config with empty connection string
+            let default_config = crate::config::Config {
+                connection_string: String::new(),
+                colors: crate::config::ColorConfig::default(),
+            };
+            (default_config, Some(e.to_string()))
+        }
+    };
+    
+    run_interactive_mode(config, cli.file, config_error)
 }
 
-fn run_interactive_mode(config: crate::config::Config, file_arg: Option<PathBuf>) -> anyhow::Result<()> {
+fn run_interactive_mode(config: crate::config::Config, file_arg: Option<PathBuf>, config_error: Option<String>) -> anyhow::Result<()> {
     /* ①  pick a monospace font */
     const CONSOLAS_U16: [u16; 9] =
         [0x0043, 0x006f, 0x006e, 0x0073, 0x006f, 0x006c, 0x0061, 0x0073, 0];
@@ -240,6 +233,11 @@ fn run_interactive_mode(config: crate::config::Config, file_arg: Option<PathBuf>
 
     /* ③  Workspace + optional file load */
     let mut workspace = Workspace::new(config.connection_string)?;
+    // Set initial status message if config had an error
+    if let Some(error_msg) = config_error {
+        workspace.status_message = Some(error_msg);
+        workspace.status_message_time = Some(Instant::now());
+    }
 
     /* ───── publish raw pointer for the ctrl-handler ───── */
     WORKSPACE_PTR.get_or_init(|| Mutex::new(WsPtr(&mut workspace as *mut _)));
@@ -339,9 +337,11 @@ fn run_interactive_mode(config: crate::config::Config, file_arg: Option<PathBuf>
     /* ⑤  event/render loop */
     let anim_tick = Duration::from_millis(100);
     let timer_update = Duration::from_millis(333);
+    let full_refresh_interval = Duration::from_millis(100);  // Full refresh every 500ms
     let mut last_anim = Instant::now();
     let mut last_timer = Instant::now();
     let mut last_draw = Instant::now();
+    let mut last_full_refresh = Instant::now();
     let mut dirty = true;
 
     'main: loop {
@@ -379,6 +379,12 @@ fn run_interactive_mode(config: crate::config::Config, file_arg: Option<PathBuf>
             workspace.render(&mut term)?;
             last_draw = Instant::now();
             dirty = false;
+        }
+
+        // Force a full clear and redraw every 500ms to clear any stray messages
+        if last_full_refresh.elapsed() >= full_refresh_interval {
+            dirty = true;  // Just mark as dirty to trigger normal render
+            last_full_refresh = Instant::now();
         }
 
         if last_anim.elapsed() >= anim_tick {

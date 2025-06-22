@@ -91,6 +91,10 @@ pub fn run_batch_mode(config: BatchConfig) -> Result<()> {
 
     while results_count + errors_count < total_queries {
         match db_resp_rx.recv_timeout(Duration::from_secs(300)) {
+            Ok(DbWorkerResponse::Connected) => {
+                // Connection established, continue
+                continue;
+            }
             Ok(DbWorkerResponse::QueryStarted { query_idx: _, query_context, .. }) => {
                 if config.verbose {
                     println!("\nExecuting {}", query_context);

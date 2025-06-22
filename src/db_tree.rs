@@ -57,6 +57,8 @@ pub struct DbTree {
     pub role_selection_mode: bool,
     pub selected_role_index: usize,
     pending_action: Option<TreeAction>,
+    connected: bool,
+    needs_refresh: bool, 
 }
 
 impl DbTree {
@@ -78,10 +80,10 @@ impl DbTree {
             role_selection_mode: false,
             selected_role_index: 0,
             pending_action: None,
+            connected: false,
+            needs_refresh: true,
         };
 
-        // Try to load cache on creation
-        tree.refresh_cache();
         
         // Since we use "USE SECONDARY ROLES ALL" on startup, ensure UI reflects this
         if let Some(cache) = &mut tree.cache {
@@ -89,10 +91,22 @@ impl DbTree {
         }
         tree.selected_role_index = 0;  // 0 = "All Roles" in the menu
 
-        
-        // Try to load cache on creation
-        tree.refresh_cache();
+        tree.cache = Some(SchemaCache::new());
         tree
+    }
+
+    pub fn check_refresh(&mut self) {
+        if self.needs_refresh && self.visible && self.connected {  // Add connected check
+            self.needs_refresh = false;
+            // Clear both caches to force reload from disk
+            self.cache = None;
+            self.db_navigator.clear_cache();
+            self.refresh_cache();
+        }
+    }
+
+    pub fn set_connected(&mut self, connected: bool) {
+        self.connected = connected;
     }
 
     fn get_object_text(&self, node: &TreeNode) -> Option<String> {
@@ -121,13 +135,19 @@ impl DbTree {
     pub fn on_show(&mut self) {
         // Called when tree becomes visible
         self.focused = true;
-        // Clear both caches to force reload from disk
-        self.cache = None;
-        self.db_navigator.clear_cache();
-        self.refresh_cache();
+        // Don't refresh immediately - just mark that we need to
+        self.needs_refresh = true;
     }
     
     fn refresh_cache(&mut self) {
+        // Don't try to refresh if not connected
+        if !self.connected {
+            // Just show empty tree
+            self.cache = Some(SchemaCache::new());
+            self.rebuild_visible_nodes();
+            return;
+        }
+        
         // Try to load cache
         match self.db_navigator.load_cache() {
             Ok(cache) => {
@@ -140,8 +160,14 @@ impl DbTree {
                 self.rebuild_visible_nodes();
             }
             Err(_) => {
-                // Cache doesn't exist, request full refresh
-                let _ = self.db_navigator.request_refresh("REFRESH ALL");
+                // Cache doesn't exist, request full refresh only if connected
+                if self.connected {
+                    let _ = self.db_navigator.request_refresh("REFRESH ALL");
+                } else {
+                    // Just show empty tree
+                    self.cache = Some(SchemaCache::new());
+                    self.rebuild_visible_nodes();
+                }
             }
         }
     }
@@ -697,6 +723,10 @@ impl DbTree {
             // For Ctrl+R (refresh current node)
             KeyCode::Char('r') | KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 // Refresh current node
+                if !self.connected {
+                    // Don't refresh if not connected
+                    return false;
+                }
                 if let Some((node, _)) = self.visible_nodes.get(self.selected_index) {
                     match node {
                         TreeNode::Database(db) => {
@@ -720,6 +750,10 @@ impl DbTree {
 
             // For Ctrl+Shift+R (full refresh)
             KeyCode::Char('r') | KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
+                if !self.connected {
+                    // Don't refresh if not connected
+                    return false;
+                }
                 let _ = self.db_navigator.request_refresh("REFRESH ALL");
                 self.cache = None;
                 return false;

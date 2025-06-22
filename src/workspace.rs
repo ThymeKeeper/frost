@@ -36,6 +36,7 @@ pub enum DbWorkerRequest {
 
 #[derive(Debug)]
 pub enum DbWorkerResponse {
+    Connected,
     QueryStarted { query_idx: usize, started: Instant, query_context: String },
     QueryFinished { query_idx: usize, elapsed: Duration, result: ResultsContent },
     QueryError { query_idx: usize, elapsed: Duration, message: String },
@@ -90,6 +91,8 @@ pub struct Workspace {
     results_hidden: bool,
     editor_hidden: bool,
     drag_source: Option<Focus>,  // Track which pane started a drag
+    pub connected: bool,  // Track Snowflake connection status
+    pub frame_counter: u32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -116,23 +119,52 @@ pub fn start_db_worker(
     // clone into the worker-thread
     let thread_stmt = Arc::clone(&current_stmt);
     thread::spawn(move || {
+        // Try to create environment
         let env = match create_environment_v3() {
             Ok(env) => env,
-            Err(_) => return,
+            Err(_) => {
+                // Don't exit - keep thread alive but not connected
+                loop {
+                    match req_rx.recv() {
+                        Ok(DbWorkerRequest::Quit) | Err(_) => break,
+                        _ => {
+                            // Ignore other requests when not connected
+                            continue;
+                        }
+                    }
+                }
+                return;
+            }
         };
+        
+        // Try to connect
         let conn = match env.connect_with_connection_string(&conn_str) {
-            Ok(conn) => conn,
-            Err(_) => return,
+            Ok(conn) => {
+                // Signal successful connection
+                let _ = resp_tx.send(DbWorkerResponse::Connected);
+                
+                // Enable all secondary roles by default
+                if let Ok(stmt) = Statement::with_parent(&conn) {
+                    let _ = stmt.exec_direct("USE SECONDARY ROLES ALL");
+                }
+                
+                conn
+            }
+            Err(_) => {
+                // Connection failed - keep thread alive but not connected
+                // Don't send an error response here - let the UI handle the "Not Connected" state
+                loop {
+                    match req_rx.recv() {
+                        Ok(DbWorkerRequest::Quit) | Err(_) => break,
+                        _ => {
+                            // Ignore other requests when not connected
+                            continue;
+                        }
+                    }
+                }
+                return;
+            }
         };
-
-        // Enable all secondary roles by default
-        let stmt = match Statement::with_parent(&conn) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let _ = stmt.exec_direct("USE SECONDARY ROLES ALL");
-        //eprintln!("Enabled all secondary roles for session");
-
 
         loop {
             match req_rx.recv() {
@@ -162,7 +194,6 @@ pub fn start_db_worker(
 
                         // Execute the SQL text.
                         let exec_result = stmt.exec_direct(query);
-
 
                         match exec_result {
                             Ok(Data(mut stmt)) => {
@@ -240,7 +271,7 @@ pub fn start_db_worker(
                                 break;
                             }
                         }
-                        // clear handle – we’re done with it (success or error)
+                        // clear handle – we're done with it (success or error)
                         *thread_stmt.lock().unwrap() = None;
                     }
                 }
@@ -268,7 +299,6 @@ impl Workspace {
     pub fn new(conn_str: String) -> Result<Self> {
         let (db_req_tx, db_resp_rx, current_stmt) = start_db_worker(conn_str.clone());
         let mut editor = Editor::new();
-        let mut db_tree = DbTree::new();
         let db_tree = DbTree::new();
         
         // Initialize schema cache for autocomplete
@@ -305,7 +335,9 @@ impl Workspace {
             autosave: Autosave::new(None),
             file_path: None,
             file_lock: None,
+            connected: false,
             db_tree, 
+            frame_counter: 0,
         })
     }
 
@@ -1353,7 +1385,9 @@ impl Workspace {
         false
     }
 
-    pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+    self.frame_counter = self.frame_counter.wrapping_add(1);
+    
     terminal.draw(|f| {
         let size = f.size();
 
@@ -1362,9 +1396,21 @@ impl Workspace {
             return;                   // nothing we can draw safely
         }
 
-        // ── paint the whole canvas once, then draw widgets over it ─────────
+        // ── Alternate background color very slightly to force repaint ─────────
         use tui::widgets::Block;
-        f.render_widget(Block::default().style(STYLE::default_bg()), size);
+        use tui::style::{Style, Color};
+        
+        // Alternate between RGB(22,22,22) and RGB(22,22,23) - imperceptible difference
+        let bg_color = if self.frame_counter % 2 == 0 {
+            Color::Rgb(22, 22, 22)
+        } else {
+            Color::Rgb(22, 22, 23)
+        };
+        
+        f.render_widget(
+            Block::default().style(Style::default().bg(bg_color)), 
+            size
+        );
 
         /* ── 1️⃣  Help overlay?  draw + return ───────────────────────────── */
         if self.show_help {
@@ -1461,13 +1507,14 @@ impl Workspace {
             let status_chunk = if self.results_hidden { chunks[0] } else { chunks[1] };
             
             // helper-closure for the old fallback text
-            let default_status = |msg: &Option<String>, err: &Option<String>| -> (String, tui::style::Style) {
+            let default_status = |msg: &Option<String>, err: &Option<String>, connected: bool| -> (String, tui::style::Style) {
+                let conn_status = if connected { "[Connected]" } else { "[Not Connected]" };
                 if let Some(m) = msg {
-                    (m.clone(), STYLE::status_fg())
+                    (format!("{} | {}", conn_status, m), STYLE::status_fg())
                 } else if let Some(e) = err {
-                    (format!("Press F1 for help | Error: {e}"), STYLE::status_fg())
+                    (format!("{} | Press F1 for help | Error: {}", conn_status, e), STYLE::status_fg())
                 } else {
-                    ("Press F1 for help".into(), STYLE::status_fg())
+                    (format!("{} | Press F1 for help", conn_status), STYLE::status_fg())
                 }
             };
             
@@ -1493,7 +1540,7 @@ impl Workspace {
             }
             
             // default status (editor focus or no selection) ─────────────────────────
-            let (txt, style) = default_status(&self.status_message, &self.error);
+            let (txt, style) = default_status(&self.status_message, &self.error, self.connected);
             let bar = tui::widgets::Paragraph::new(txt).style(style);
             f.render_widget(bar, status_chunk);
             
@@ -1552,13 +1599,14 @@ impl Workspace {
         }
 
         // helper-closure for the old fallback text
-        let default_status = |msg: &Option<String>, err: &Option<String>| -> (String, tui::style::Style) {
+        let default_status = |msg: &Option<String>, err: &Option<String>, connected: bool| -> (String, tui::style::Style) {
+            let conn_status = if connected { "[Connected]" } else { "[Not Connected]" };
             if let Some(m) = msg {
-                (m.clone(), STYLE::status_fg())
+                (format!("{} | {}", conn_status, m), STYLE::status_fg())
             } else if let Some(e) = err {
-                (format!("Press F1 for help | Error: {e}"), STYLE::status_fg())
+                (format!("{} | Press F1 for help | Error: {}", conn_status, e), STYLE::status_fg())
             } else {
-                ("Press F1 for help".into(), STYLE::status_fg())
+                (format!("{} | Press F1 for help", conn_status), STYLE::status_fg())
             }
         };
 
@@ -1584,7 +1632,7 @@ impl Workspace {
         }
 
         // default status (editor focus or no selection) ─────────────────────────
-        let (txt, style) = default_status(&self.status_message, &self.error);
+        let (txt, style) = default_status(&self.status_message, &self.error, self.connected);
         let bar = tui::widgets::Paragraph::new(txt).style(style);
         f.render_widget(bar, chunks[if self.results_hidden { 1 } else { 2 }]);
         /* ── 5️⃣  Batch generator overlay? ─────────────────────────────── */
@@ -1990,6 +2038,9 @@ impl Workspace {
             self.status_message      = Some(msg);
             self.status_message_time = Some(Instant::now());
         }
+
+        self.db_tree.check_refresh();
+        
         /* ── running ──────────────────────────*/
         if self.running {
             self.run_duration = self.run_started.map(|s| s.elapsed());
@@ -2191,6 +2242,13 @@ impl Workspace {
         }
         while let Ok(msg) = self.db_resp_rx.try_recv() {
             match msg {
+                DbWorkerResponse::Connected => {
+                    self.connected = true;
+                    self.db_tree.set_connected(true);
+                    self.status_message = Some("Connected to Snowflake".to_string());
+                    self.status_message_time = Some(Instant::now());
+                    changed = true;
+                }
                 DbWorkerResponse::QueryStarted { query_idx: _, started, query_context } => {
                     // Add a tab for this query
                     self.results.tabs.push(crate::results::ResultsTab::new_pending_with_start(query_context, started));
