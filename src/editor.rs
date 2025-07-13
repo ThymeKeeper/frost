@@ -188,7 +188,6 @@ pub struct Editor {
     // Paste detection
     in_find_jump: bool,
     
-    pub last_edit_time: Option<Instant>,
     last_clip: Option<String>,
     pub find_cursor_pos: usize,
     pub find_active: bool,
@@ -227,7 +226,6 @@ impl Editor {
             last_action: None,
             last_action_time: None,
             in_find_jump: false,
-            last_edit_time: None,
             last_clip: None,
             find_cursor_pos: 0,
             find_active: false,
@@ -718,7 +716,6 @@ impl Editor {
         
         self.last_action = Some(action);
         self.last_action_time = Some(Instant::now());
-        self.last_edit_time = Some(Instant::now());
     }
     
     fn undo(&mut self) {

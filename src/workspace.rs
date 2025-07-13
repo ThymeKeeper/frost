@@ -4,10 +4,9 @@ use crate::syntax::{ParseState, step, Step};
 use crate::tile_rowstore::NULL_SENTINEL;
 use crate::batch_generator::BatchGeneratorDialog;
 use crate::palette::STYLE;
-use crate::autosave::Autosave;
-use crate::locked_file::LockedFile;
 use crate::editor::GUTTER_WIDTH;
 use crate::db_tree::{DbTree, TreeAction};
+use crate::editor::normalize_text_for_terminal;
 
 use odbc::{create_environment_v3, Data, ResultSetState, Statement, Handle};
 use odbc::ffi::{SQLCancel, SQLHSTMT};   // raw FFI symbols live in `odbc::ffi`
@@ -24,6 +23,8 @@ use anyhow::Result;
 use directories::UserDirs;
 use std::path::PathBuf;
 
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::SetConsoleTitleW;
 
 const MIN_ROWS: i16 = 3;
 
@@ -42,12 +43,103 @@ pub enum DbWorkerResponse {
     QueryError { query_idx: usize, elapsed: Duration, message: String },
 }
 
-/// Thin wrapper around the raw `SQLHSTMT` pointer that marks it as
-/// safe to move/share between threads.  The safety promise we make:
-/// * We never dereference the pointer in Rust – it’s only passed back
-///   to the driver ( `SQLCancel` ).
-/// * The lifetime of the handle is controlled by the ODBC driver; we
-///   use it strictly for cancellation while the statement is running.
+pub struct SaveAsDialog {
+    pub active: bool,
+    pub file_path: String,
+    pub cursor_pos: usize,
+    pub message: Option<String>,
+}
+
+impl SaveAsDialog {
+    pub fn new() -> Self {
+        // Get current directory and add trailing slash
+        let current_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .to_string_lossy()
+            .to_string();
+        
+        let file_path = if current_dir.ends_with(std::path::MAIN_SEPARATOR) {
+            current_dir
+        } else {
+            format!("{}{}", current_dir, std::path::MAIN_SEPARATOR)
+        };
+        
+        Self {
+            active: true,
+            file_path: file_path.clone(),
+            cursor_pos: file_path.len(),
+            message: None,
+        }
+    }
+    
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<PathBuf> {
+        match key.code {
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.file_path.insert(self.cursor_pos, ch);
+                self.cursor_pos += 1;
+            }
+            KeyCode::Backspace => {
+                if self.cursor_pos > 0 && self.file_path.len() > 0 {
+                    self.cursor_pos -= 1;
+                    self.file_path.remove(self.cursor_pos);
+                }
+            }
+            KeyCode::Delete => {
+                if self.cursor_pos < self.file_path.len() {
+                    self.file_path.remove(self.cursor_pos);
+                }
+            }
+            KeyCode::Left => {
+                if self.cursor_pos > 0 {
+                    self.cursor_pos -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if self.cursor_pos < self.file_path.len() {
+                    self.cursor_pos += 1;
+                }
+            }
+            KeyCode::Home => {
+                self.cursor_pos = 0;
+            }
+            KeyCode::End => {
+                self.cursor_pos = self.file_path.len();
+            }
+            KeyCode::Enter => {
+                let path = PathBuf::from(&self.file_path);
+                
+                // Validate the path
+                if self.file_path.trim().is_empty() {
+                    self.message = Some("Please enter a filename".to_string());
+                    return None;
+                }
+                
+                // Check if it's a directory
+                if path.is_dir() {
+                    self.message = Some("Path is a directory, please specify a filename".to_string());
+                    return None;
+                }
+                
+                // Check if parent directory exists
+                if let Some(parent) = path.parent() {
+                    if !parent.exists() {
+                        self.message = Some("Parent directory does not exist".to_string());
+                        return None;
+                    }
+                }
+                
+                self.active = false;
+                return Some(path);
+            }
+            KeyCode::Esc => {
+                self.active = false;
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct SafeStmt(SQLHSTMT);
 unsafe impl Send for SafeStmt {}
@@ -64,6 +156,7 @@ pub struct Workspace {
     pub run_duration: Option<Duration>,
     pub running_query_idx: Option<usize>,
     pub batch_generator: Option<BatchGeneratorDialog>,
+    pub save_as_dialog: Option<SaveAsDialog>,
 
     pub last_editor_area: Option<Rect>,
     pub last_results_area: Option<Rect>,
@@ -73,11 +166,13 @@ pub struct Workspace {
     pub status_message: Option<String>,
     pub status_message_time: Option<Instant>,
     
-    pub autosave: Autosave,
     pub file_path: Option<std::path::PathBuf>,
-    pub file_lock: Option<LockedFile>,
+    pub original_content: String,
 
     pub show_help: bool,
+    pub show_exit_dialog: bool,
+    pub exit_requested: bool,
+    pub exit_after_save: bool,
 
     pub db_req_tx: Sender<DbWorkerRequest>,
     pub db_resp_rx: Receiver<DbWorkerResponse>,
@@ -101,6 +196,8 @@ pub enum Focus {
     Results,
     DbTree,
 }
+
+
 
 pub fn start_db_worker(
     conn_str: String,
@@ -312,6 +409,7 @@ impl Workspace {
             error: None,
             running: false,
             batch_generator: None,
+            save_as_dialog: None,
             run_started: None,
             run_duration: None,
             running_query_idx: None,
@@ -332,13 +430,89 @@ impl Workspace {
             editor_hidden: false,
             show_help: false,
             drag_source: None,
-            autosave: Autosave::new(None),
+            show_exit_dialog: false,
+            exit_requested: false,
+            exit_after_save: false,
             file_path: None,
-            file_lock: None,
+            original_content: String::new(),
             connected: false,
             db_tree, 
             frame_counter: 0,
         })
+    }
+
+    /// Update the console title based on current file and dirty state
+    fn update_title(&self) {
+        #[cfg(windows)]
+        {
+            let title = if let Some(path) = &self.file_path {
+                let fname = path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                if self.editor.dirty {
+                    format!("{}*", fname)
+                } else {
+                    format!("{}", fname)
+                }
+            } else {
+                if self.editor.dirty {
+                    "[No Name]*".to_string()
+                } else {
+                    "[No Name]".to_string()
+                }
+            };
+            
+            // Call Windows API to set title
+            use std::ffi::OsStr;
+            use std::os::windows::prelude::*;
+            let wide: Vec<u16> = OsStr::new(&title)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            unsafe { 
+                windows_sys::Win32::System::Console::SetConsoleTitleW(wide.as_ptr());
+            }
+        }
+    }
+
+    /// Check if there are unsaved changes
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.editor.buffer != self.original_content
+    }
+
+    /// Save the current file
+    pub fn save(&mut self) -> Result<()> {
+        if let Some(path) = &self.file_path {
+            std::fs::write(path, &self.editor.buffer)?;
+            self.original_content = self.editor.buffer.clone();
+            self.editor.dirty = false;
+            self.status_message = Some(format!("Saved to {}", path.display()));
+            self.status_message_time = Some(Instant::now());
+            self.update_title();
+            Ok(())
+        } else {
+            // No file path, prompt for save as
+            self.save_as()
+        }
+    }
+
+    /// Save as a new file (simplified - in a real app you'd show a file dialog)
+    pub fn save_as(&mut self) -> Result<()> {
+        self.save_as_dialog = Some(SaveAsDialog::new());
+        Ok(())
+    }
+
+    /// Load a file
+    pub fn load_file(&mut self, path: PathBuf) -> Result<()> {
+        let content = std::fs::read_to_string(&path)?;
+        self.editor.buffer = normalize_text_for_terminal(&content);
+        self.editor.caret = 0;
+        self.editor.clear_sel();
+        self.file_path = Some(path.clone());
+        self.original_content = self.editor.buffer.clone();
+        self.editor.dirty = false;
+        self.update_title();
+        Ok(())
     }
 
     /// Extract a meaningful context/name from a SQL query
@@ -676,11 +850,53 @@ impl Workspace {
         }
     }
 
+    fn render_exit_dialog<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
+        use tui::widgets::*;
+        use tui::text::*;
+        
+        let dialog_width = 50;
+        let dialog_height = 7;
+        
+        let dialog_area = Rect {
+            x: (area.width - dialog_width) / 2,
+            y: (area.height - dialog_height) / 2,
+            width: dialog_width,
+            height: dialog_height,
+        };
+        
+        f.render_widget(Clear, dialog_area);
+        
+        let block = Block::default()
+            .title(" Unsaved Changes ")
+            .borders(Borders::ALL)
+            .border_style(STYLE::help_border());
+        
+        let inner = block.inner(dialog_area);
+        f.render_widget(block, dialog_area);
+        
+        let text = vec![
+            Spans::from(""),
+            Spans::from("  You have unsaved changes."),
+            Spans::from("  Save before exiting?"),
+            Spans::from(""),
+            Spans::from("  Y: Save and exit  N: Exit without saving  Esc: Cancel"),
+        ];
+        
+        let paragraph = Paragraph::new(text)
+            .style(STYLE::plain());
+        f.render_widget(paragraph, inner);
+    }
+
     fn render_help<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
         use tui::widgets::*;
 
         const HELP: &[&str] = &[
             " Frost  –  Key Reference ",
+            "",
+            "  💾 File Operations",
+            "      Ctrl + S             Save file",
+            "      Ctrl + Shift + S     Save as new file",
+            "      Ctrl + Q             Quit (prompts if unsaved changes)",
             "",
             "  🔄 Navigation & Focus",
             "      Esc                  Cycle focus between visible panes",
@@ -726,7 +942,6 @@ impl Workspace {
             "     Ctrl + Click         Toggle row/column in selection",
             "",
             "     F1                   Close this help screen",
-            "     Ctrl + Q             Quit Frost",
         ];
 
         let text = HELP.join("\n");
@@ -891,6 +1106,73 @@ impl Workspace {
                 .wrap(Wrap { trim: true });
                 
             f.render_widget(paragraph, dialog_area);
+        }
+    }
+
+    fn render_save_as_dialog<B: Backend>(&self, f: &mut Frame<B>, area: Rect) {
+        use tui::widgets::*;
+        use tui::text::*;
+        use tui::style::{Style, Modifier, Color};
+        
+        if let Some(dialog) = &self.save_as_dialog {
+            let dialog_width = 60.min(area.width - 4);
+            let dialog_height = 8.min(area.height - 4);
+            
+            let dialog_area = Rect {
+                x: (area.width - dialog_width) / 2,
+                y: (area.height - dialog_height) / 2,
+                width: dialog_width,
+                height: dialog_height,
+            };
+            
+            f.render_widget(Clear, dialog_area);
+            
+            let block = Block::default()
+                .title(" Save As ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+            
+            let inner = block.inner(dialog_area);
+            f.render_widget(block, dialog_area);
+            
+            let mut lines = vec![
+                Spans::from("Enter filename:"),
+                Spans::from(""),
+            ];
+            
+            // Show the file path with cursor
+            let mut path_spans = vec![];
+            for (i, ch) in dialog.file_path.chars().enumerate() {
+                if i == dialog.cursor_pos {
+                    path_spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    ));
+                } else {
+                    path_spans.push(Span::raw(ch.to_string()));
+                }
+            }
+            
+            // Add cursor at end if needed
+            if dialog.cursor_pos == dialog.file_path.len() {
+                path_spans.push(Span::styled(
+                    " ",
+                    Style::default().add_modifier(Modifier::REVERSED)
+                ));
+            }
+            
+            lines.push(Spans::from(path_spans));
+            lines.push(Spans::from(""));
+            
+            // Show message if any
+            if let Some(msg) = &dialog.message {
+                lines.push(Spans::from(Span::styled(msg, Style::default().fg(Color::Yellow))));
+            } else {
+                lines.push(Spans::from("Enter: Save  Esc: Cancel"));
+            }
+            
+            let paragraph = Paragraph::new(lines);
+            f.render_widget(paragraph, inner);
         }
     }
 
@@ -1402,15 +1684,21 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         
         // Alternate between RGB(22,22,22) and RGB(22,22,23) - imperceptible difference
         let bg_color = if self.frame_counter % 2 == 0 {
-            Color::Rgb(22, 22, 22)
+            Color::Rgb(27, 27, 27)
         } else {
-            Color::Rgb(22, 22, 23)
+            Color::Rgb(27, 27, 28)
         };
         
         f.render_widget(
             Block::default().style(Style::default().bg(bg_color)), 
             size
         );
+
+        /* ── Exit dialog overlay? ─────────────────────────────── */
+        if self.show_exit_dialog {
+            self.render_exit_dialog(f, size);
+            return;
+        }
 
         /* ── 1️⃣  Help overlay?  draw + return ───────────────────────────── */
         if self.show_help {
@@ -1443,7 +1731,7 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         };
 
         /* ── if either pane became 0×0, skip this frame (prevents tui panic) */
-        if editor_h == 0 {
+        if editor_h == 0 && !self.editor_hidden {
             return;
         }
 
@@ -1466,17 +1754,9 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
             size  // Use full screen when tree is hidden
         };
 
-        /* ── Handle hidden editor ─────────────────────────────────── */
-        if self.editor_hidden {
+        // Determine status bar location and render main content
+        let status_chunk = if self.editor_hidden {
             // Editor is hidden, results takes all space
-            let _editor_h = 0u16;
-            let _results_h = if self.results_hidden {
-                0
-            } else {
-                main_area.height.saturating_sub(1)  // -1 for status bar
-            };
-            
-            // Layout without editor
             let chunks = if self.results_hidden {
                 // Both hidden? Just show status bar
                 Layout::default()
@@ -1489,7 +1769,7 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
                 Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                    Constraint::Min(1),     // Results takes all space
+                        Constraint::Min(1),     // Results takes all space
                         Constraint::Length(1),  // Status bar
                     ])
                     .split(main_area)
@@ -1503,101 +1783,59 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
                 self.results.render(f, chunks[0], self.total_queries);
             }
             
-            // Render status bar
-            let status_chunk = if self.results_hidden { chunks[0] } else { chunks[1] };
-            
-            // helper-closure for the old fallback text
-            let default_status = |msg: &Option<String>, err: &Option<String>, connected: bool| -> (String, tui::style::Style) {
-                let conn_status = if connected { "[Connected]" } else { "[Not Connected]" };
-                if let Some(m) = msg {
-                    (format!("{} | {}", conn_status, m), STYLE::status_fg())
-                } else if let Some(e) = err {
-                    (format!("{} | Press F1 for help | Error: {}", conn_status, e), STYLE::status_fg())
-                } else {
-                    (format!("{} | Press F1 for help", conn_status), STYLE::status_fg())
-                }
-            };
-            
-            // --- results-selection summary when that pane is focused ------------
-            if self.focus == Focus::Results {
-                if let Some((stats, warn)) = self.results.selection_stats() {
-                    use tui::text::{Span, Spans};
-
-                    let spans = if let Some(w) = warn {
-                        Spans::from(vec![
-                            Span::raw(stats),
-                            Span::raw("  |  "),
-                            Span::styled(w, STYLE::error_fg()),   // red only for warning
-                        ])
-                    } else {
-                        Spans::from(Span::raw(stats))
-                    };
-
-                    let bar = tui::widgets::Paragraph::new(spans).style(STYLE::status_fg());
-                    f.render_widget(bar, status_chunk);
-                    return;            // nothing else goes into the status bar
-                }
-            }
-            
-            // default status (editor focus or no selection) ─────────────────────────
-            let (txt, style) = default_status(&self.status_message, &self.error, self.connected);
-            let bar = tui::widgets::Paragraph::new(txt).style(style);
-            f.render_widget(bar, status_chunk);
-            
-            /* ── Batch generator overlay? ─────────────────────────────── */
-            if self.batch_generator.is_some() {
-                self.render_batch_generator(f, size);
-            }
-            
-            return;
-        }
-        
-        // NEW: Adjust layout based on whether results are hidden
-        let chunks = if self.results_hidden {
-            Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),  // Editor takes remaining space
-                Constraint::Length(1),  // Status bar
-            ])
-            .split(main_area)
+            // Return status bar location
+            if self.results_hidden { chunks[0] } else { chunks[1] }
         } else {
-            Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(editor_h),
-                Constraint::Length(results_h),
-                Constraint::Length(1),  // Status bar
-            ])
-            .split(main_area)
+            // Editor is visible
+            let chunks = if self.results_hidden {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),     // Editor takes remaining space
+                        Constraint::Length(1),  // Status bar
+                    ])
+                    .split(main_area)
+            } else {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(editor_h),
+                        Constraint::Length(results_h),
+                        Constraint::Length(1),  // Status bar
+                    ])
+                    .split(main_area)
+            };
+
+            /* ── 3️⃣  remember rectangles + update derived limits ───────────── */
+            self.last_editor_area  = Some(chunks[0]);
+            if !self.results_hidden {
+                self.last_results_area = Some(chunks[1]);
+                self.results.max_rows = chunks[1].height.saturating_sub(4).max(1) as usize;
+                self.results.max_cols = (chunks[1].width / 20).max(2) as usize;
+            }
+
+            self.editor.set_viewport_size(
+                chunks[0].height.saturating_sub(2) as usize,
+                chunks[0].width.saturating_sub(GUTTER_WIDTH + 2) as usize,
+            );
+
+            self.editor.focus  = self.focus == Focus::Editor;
+            self.results.focus = self.focus == Focus::Results;
+            self.db_tree.focused = self.focus == Focus::DbTree;
+
+            /* ── 4️⃣  actual drawing ─────────────────────────────────────────── */
+            self.editor.render(f, chunks[0]);
+            
+            // NEW: Only render results if visible
+            if !self.results_hidden {
+                self.results.render(f, chunks[1], self.total_queries);
+            }
+            
+            // Return status bar location
+            if self.results_hidden { chunks[1] } else { chunks[2] }
         };
 
-        /* ── 3️⃣  remember rectangles + update derived limits ───────────── */
-        self.last_editor_area  = Some(chunks[0]);
-        if !self.results_hidden {
-            self.last_results_area = Some(chunks[1]);
-
-            self.results.max_rows = chunks[1].height.saturating_sub(4).max(1) as usize;
-            self.results.max_cols = (chunks[1].width / 20).max(2) as usize;
-        }
-
-        self.editor.set_viewport_size(
-            chunks[0].height.saturating_sub(2) as usize,
-            chunks[0].width.saturating_sub(GUTTER_WIDTH + 2) as usize,
-        );
-
-        self.editor.focus  = self.focus == Focus::Editor;
-        self.results.focus = self.focus == Focus::Results;
-        self.db_tree.focused = self.focus == Focus::DbTree;
-
-        /* ── 4️⃣  actual drawing ─────────────────────────────────────────── */
-        self.editor.render(f, chunks[0]);
-        
-        // NEW: Only render results if visible
-        if !self.results_hidden {
-            self.results.render(f, chunks[1], self.total_queries);
-        }
-
+        // ── Render status bar (single location for all cases) ────────────
         // helper-closure for the old fallback text
         let default_status = |msg: &Option<String>, err: &Option<String>, connected: bool| -> (String, tui::style::Style) {
             let conn_status = if connected { "[Connected]" } else { "[Not Connected]" };
@@ -1609,8 +1847,7 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
                 (format!("{} | Press F1 for help", conn_status), STYLE::status_fg())
             }
         };
-
-        // --- results-selection summary when that pane is focused ------------
+        // Check if we should show results selection summary
         if self.focus == Focus::Results {
             if let Some((stats, warn)) = self.results.selection_stats() {
                 use tui::text::{Span, Spans};
@@ -1624,26 +1861,32 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
                 } else {
                     Spans::from(Span::raw(stats))
                 };
-
                 let bar = tui::widgets::Paragraph::new(spans).style(STYLE::status_fg());
-                f.render_widget(bar, chunks[if self.results_hidden { 1 } else { 2 }]);
-                return;            // nothing else goes into the status bar
-            }
+                f.render_widget(bar, status_chunk);
+            } else {
+                // No selection stats, show default status
+                let (txt, style) = default_status(&self.status_message, &self.error, self.connected);
+                let bar = tui::widgets::Paragraph::new(txt).style(style);
+                f.render_widget(bar, status_chunk);
+             }
+        } else {
+            // Not focused on results, show default status
+            let (txt, style) = default_status(&self.status_message, &self.error, self.connected);
+            let bar = tui::widgets::Paragraph::new(txt).style(style);
+            f.render_widget(bar, status_chunk);
         }
-
-        // default status (editor focus or no selection) ─────────────────────────
-        let (txt, style) = default_status(&self.status_message, &self.error, self.connected);
-        let bar = tui::widgets::Paragraph::new(txt).style(style);
-        f.render_widget(bar, chunks[if self.results_hidden { 1 } else { 2 }]);
         /* ── 5️⃣  Batch generator overlay? ─────────────────────────────── */
         if self.batch_generator.is_some() {
             self.render_batch_generator(f, size);
         }
+
+        /* ── Save-as dialog overlay? ─────────────────────────────── */
+        if self.save_as_dialog.is_some() {
+            self.render_save_as_dialog(f, size);
+        }
     })?;
     Ok(())
 }
-
-
 
     fn adjust_split(&mut self, delta: i16) {
         let lo = self.min_split_offset.min(self.max_split_offset);
@@ -1651,10 +1894,65 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         self.split_offset = (self.split_offset + delta).clamp(lo, hi);
     }
 
+    /// Request to exit the application
+    pub fn request_exit(&mut self) -> bool {
+        if self.has_unsaved_changes() {
+            self.show_exit_dialog = true;
+            self.exit_requested = true;
+            false  // Don't exit yet
+        } else {
+            true   // OK to exit immediately
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
-        // Handle Ctrl+Q first (quit)
-        if (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q')) && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Ok(true);
+        // Handle Ctrl+Q with confirmation
+        if (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q')) 
+            && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.has_unsaved_changes() {
+                self.show_exit_dialog = true;
+                return Ok(false);
+            } else {
+                return Ok(true);  // Exit immediately if no changes
+            }
+        }
+
+        // Handle exit dialog
+        if self.show_exit_dialog {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    // Try to save
+                    if self.file_path.is_some() {
+                        // File exists, save directly
+                        if let Err(e) = self.save() {
+                            self.status_message = Some(format!("Save failed: {}", e));
+                            self.status_message_time = Some(Instant::now());
+                            self.show_exit_dialog = false;
+                            self.exit_requested = false;
+                            return Ok(false);
+                        }
+                        return Ok(true);  // Exit after saving
+                    } else {
+                        // No file, show save-as dialog
+                        self.show_exit_dialog = false;  // Hide exit dialog
+                        self.exit_after_save = true;    // Set flag to exit after save
+                        self.save_as_dialog = Some(SaveAsDialog::new());
+                        return Ok(false);  // Don't exit yet
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    // Exit without saving
+                    return Ok(true);
+                }
+                KeyCode::Esc => {
+                    // Cancel exit
+                    self.show_exit_dialog = false;
+                    self.exit_requested = false;
+                    self.exit_after_save = false;
+                    return Ok(false);
+                }
+                _ => return Ok(false),
+            }
         }
 
         // Handle F1 (help)
@@ -1666,6 +1964,29 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         /* block all other keys while help is shown */
         if self.show_help {
             return Ok(false);
+        }
+
+        // Add save commands
+        if key.kind == KeyEventKind::Press && key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        // Ctrl+Shift+S = Save As
+                        if let Err(e) = self.save_as() {
+                            self.status_message = Some(format!("Save as failed: {}", e));
+                            self.status_message_time = Some(Instant::now());
+                        }
+                    } else {
+                        // Ctrl+S = Save
+                        if let Err(e) = self.save() {
+                            self.status_message = Some(format!("Save failed: {}", e));
+                            self.status_message_time = Some(Instant::now());
+                        }
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            }
         }
 
         // Handle batch generator dialog - MUST consume ALL key events when active
@@ -1688,6 +2009,65 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
                 }
             }
             return Ok(false);  // ALWAYS consume the event when dialog is active
+        }
+
+        // Handle save-as dialog
+        if self.save_as_dialog.is_some() {
+            if key.kind != KeyEventKind::Press {
+                return Ok(false);
+            }
+            let mut save_path = None;
+            let mut save_error = None;
+            let mut should_close = false;
+            
+            if let Some(dialog) = &mut self.save_as_dialog {
+                if let Some(path) = dialog.handle_key(key) {
+                    save_path = Some(path);
+                }
+                should_close = !dialog.active;
+            }
+            
+            // Handle save operation outside the borrow
+            if let Some(path) = save_path {
+                match std::fs::write(&path, &self.editor.buffer) {
+                    Ok(_) => {
+                        self.file_path = Some(path.clone());
+                        self.original_content = self.editor.buffer.clone();
+                        self.editor.dirty = false;
+                        self.status_message = Some(format!("Saved to {}", path.display()));
+                        self.status_message_time = Some(Instant::now());
+                        self.save_as_dialog = None;
+                        self.update_title();
+                        // Check if we should exit after save
+                        if self.exit_after_save {
+                            self.exit_after_save = false;
+                            return Ok(true);  // Exit now
+                        }
+                    }
+                    Err(e) => {
+                        save_error = Some(format!("Save failed: {}", e));
+                    }
+                }
+            }
+            
+            // Apply error message if any
+            if let Some(error) = save_error {
+                if let Some(dialog) = &mut self.save_as_dialog {
+                    dialog.message = Some(error);
+                }
+            }
+            
+            // Close dialog if needed
+            if should_close {
+                self.save_as_dialog = None;
+                // If user cancelled save-as while trying to exit, reset exit flags
+                if self.exit_after_save {
+                    self.exit_after_save = false;
+                    self.exit_requested = false;
+                }
+            }
+            
+            return Ok(false);
         }
 
         // Block ctrl+enter only during running!
@@ -1885,7 +2265,12 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         // Pass key to focused pane
         match self.focus {
             Focus::Editor => {
+                let was_dirty = self.editor.dirty;
                 self.editor.handle_key(key);
+                // Update title if dirty state changed
+                if was_dirty != self.editor.dirty {
+                    self.update_title();
+                }
             }
             Focus::Results => {
                 self.results.handle_key(key);
@@ -2026,18 +2411,6 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
     }
 
     pub fn update(&mut self) {
-        /* ── 0️⃣ autosave bookkeeping ────────────────────────── */
-        if self.editor.dirty {
-            self.autosave.notify_edit();
-            self.editor.dirty = false;
-        }
-        if let Some(msg) =
-            self.autosave
-                .maybe_flush(&self.editor.buffer, self.editor.last_edit_time)
-        {
-            self.status_message      = Some(msg);
-            self.status_message_time = Some(Instant::now());
-        }
 
         self.db_tree.check_refresh();
         
@@ -2050,26 +2423,6 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
                 self.status_message = None;
                 self.status_message_time = None;
             }
-        }
-    }
-
-    /// Called from `main` when the OS asks us to quit *right now*.
-    pub fn force_autosave(&mut self) {
-        self.autosave.force_flush(&self.editor.buffer);
-    }
-
-    /// Call on a *normal* shutdown to replace the real file with the buffer
-    /// contents and then remove any `.autosave`.
-    pub fn final_save(&mut self) {
-        // Save any pending edits before final save
-        self.editor.on_focus_lost();
-      
-        if let Some(lock) = &mut self.file_lock {
-            if let Err(_e) = lock.save_and_unlock(&self.editor.buffer) {
-                //eprintln!("Final save failed: {e}");
-                return;                  // keep .autosave as fallback
-            }
-            self.autosave.clear();       // success → delete rescue copy
         }
     }
 

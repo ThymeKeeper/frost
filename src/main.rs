@@ -7,9 +7,7 @@ mod workspace;
 mod tile_rowstore;
 mod syntax;
 mod palette;
-mod autosave;
 mod autocomplete;
-mod locked_file;
 mod config;
 mod batch_mode;
 mod batch_generator;
@@ -19,7 +17,7 @@ mod db_navigator;
 
 use std::path::PathBuf;
 use std::process;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::{
     io::{self, Write},
     mem::size_of,
@@ -101,38 +99,9 @@ enum Commands {
     },
 }
 
-/*──────────────────────── raw-ptr wrapper ──────────────────────*/
-#[derive(Copy, Clone)]
-struct WsPtr(*mut Workspace);
-unsafe impl Send for WsPtr {}
-unsafe impl Sync for WsPtr {}
-
-/*──────────────────────── globals ──────────────────────────────*/
-static WORKSPACE_PTR: OnceLock<Mutex<WsPtr>> = OnceLock::new();
-
 /*──────────────────────── constants ────────────────────────────*/
 const LF_FACESIZE: usize = 32;
 
-/*──────────────────────── close-event handler ───────────────────*/
-#[cfg(windows)]
-unsafe extern "system" fn console_close_handler(event: u32) -> BOOL {
-    const TRUE:  BOOL = 1;
-    const FALSE: BOOL = 0;
-
-    // Window's ❌ → CTRL_CLOSE_EVENT
-    if event == CTRL_CLOSE_EVENT {
-        if let Some(lock) = WORKSPACE_PTR.get() {
-            if let Ok(ptr) = lock.lock() {
-                let ws_ptr = ptr.0;
-                if !ws_ptr.is_null() {
-                    (*ws_ptr).final_save();      // same work as Ctrl-Q
-                }
-            }
-        }
-        std::process::exit(0);                   // terminate after saving
-    }
-    FALSE                                         // let other handlers run
-}
 
 /*──────────────────────── helpers ──────────────────────────────*/
 /// Change the **current** console font (Windows only).
@@ -239,81 +208,39 @@ fn run_interactive_mode(config: crate::config::Config, file_arg: Option<PathBuf>
         workspace.status_message_time = Some(Instant::now());
     }
 
-    /* ───── publish raw pointer for the ctrl-handler ───── */
-    WORKSPACE_PTR.get_or_init(|| Mutex::new(WsPtr(&mut workspace as *mut _)));
-
-    /* ───── console-control handler – save & exit ───── */
-    ctrlc::set_handler(|| {
-        if let Some(lock) = WORKSPACE_PTR.get() {
-            if let Ok(ptr_guard) = lock.lock() {
-                let ws_ptr = ptr_guard.0;
-                if !ws_ptr.is_null() {
-                    unsafe { (*ws_ptr).final_save(); }
-                }
-            }
-        }
-        process::exit(0);
+    /* ───── Signal handlers for graceful shutdown ───── */
+    let should_exit = Arc::new(Mutex::new(false));
+    let exit_clone = Arc::clone(&should_exit);
+    
+    ctrlc::set_handler(move || {
+        *exit_clone.lock().unwrap() = true;
     })?;
-
-    /* ───── NEW: hook the ❌ (window-close) event ───── */
+    
     #[cfg(windows)]
-    unsafe {
-        if SetConsoleCtrlHandler(Some(console_close_handler), 1) == 0 {
-            eprintln!("Warning: SetConsoleCtrlHandler failed – close-event won't be caught.");
+    {
+        // Handle console close events on Windows
+        let exit_clone2 = Arc::clone(&should_exit);
+        unsafe {
+            SetConsoleCtrlHandler(Some(console_handler), 1);
+        }
+        
+        unsafe extern "system" fn console_handler(ctrl_type: u32) -> BOOL {
+            match ctrl_type {
+                CTRL_CLOSE_EVENT => {
+                    // Don't exit immediately - let the main loop handle it
+                    1  // Return TRUE to indicate we handled it
+                }
+                _ => 0,
+            }
         }
     }
 
-    /* ───── NEW:  Unix (SIGHUP/SIGTERM)  graceful-exit hook ───── */
-    #[cfg(unix)]
-    {
-        use std::thread;
-        let mut signals = Signals::new([SIGHUP, SIGTERM]).expect("signals");
-        thread::spawn(move || {
-            for _sig in signals.forever() {
-                if let Some(lock) = WORKSPACE_PTR.get() {
-                    if let Ok(ptr_guard) = lock.lock() {
-                        let ws_ptr = ptr_guard.0;
-                        if !ws_ptr.is_null() {
-                            unsafe { (*ws_ptr).final_save(); }
-                        }
-                    }
-                }
-                std::process::exit(0);
-            }
-        });
-    }
-
-    /* ───── open file (and possible autosave) if CLI arg given ───── */
+    /* ───── open file if CLI arg given ───── */
     if let Some(path) = file_arg {
-        let path = PathBuf::from(&path);
-
-        let auto_path = autosave::Autosave::autosave_path(&path);
-        let (load_path, recovered) = if auto_path.exists() {
-            (auto_path.clone(), true)
-        } else {
-            (path.clone(), false)
-        };
-
-        let (lock, text) = crate::locked_file::LockedFile::open_exclusive(&load_path)?;
-        workspace.editor.buffer = normalize_text_for_terminal(&text);
-        workspace.editor.caret  = 0;
-        workspace.editor.clear_sel();
-        workspace.file_lock     = Some(lock);
-
-        if recovered {
-            workspace.status_message =
-                Some(format!("Recovered session from {}", load_path.display()));
+        if let Err(e) = workspace.load_file(path.clone()) {
+            workspace.status_message = Some(format!("Failed to load file: {}", e));
             workspace.status_message_time = Some(Instant::now());
         }
-
-        let fname = load_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        set_console_title(&format!("{}", fname));
-
-        workspace.autosave.set_path(path.clone());
-        workspace.file_path = Some(path);
     } else {
         set_console_title("Frost");
     }
@@ -345,6 +272,14 @@ fn run_interactive_mode(config: crate::config::Config, file_arg: Option<PathBuf>
     let mut dirty = true;
 
     'main: loop {
+        // Check if exit was requested via signal
+        if *should_exit.lock().unwrap() {
+            *should_exit.lock().unwrap() = false;  // Reset flag
+            if workspace.request_exit() {
+                break 'main;
+            }
+            dirty = true;  // Show exit dialog
+        }
         if workspace.poll_db_responses() {
             dirty = true;
         }
@@ -391,9 +326,6 @@ fn run_interactive_mode(config: crate::config::Config, file_arg: Option<PathBuf>
             last_anim = Instant::now();
         }
     }
-
-    /* ─── graceful quit: persist file and restore console ─── */
-    workspace.final_save();
 
     let mut out = io::stdout();
     crossterm::queue!(
