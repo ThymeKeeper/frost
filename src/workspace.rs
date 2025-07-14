@@ -1350,6 +1350,8 @@ impl Workspace {
         let mut begin_count = 0;
         let mut in_as_clause = false;
         let mut found_as = false;
+        let mut in_dollar_block = false;
+        let mut in_dollar_block = false;
         
         // Skip to AS keyword
         while i < bytes.len() {
@@ -1363,12 +1365,39 @@ impl Workspace {
                         found_as = true;
                         in_as_clause = true;
                         i = next;
+                        // Skip whitespace after AS
+                        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                            i += 1;
+                        }
+                        
+                        // Check if we have $$ after AS
+                        if i + 2 <= bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'$' {
+                            in_dollar_block = true;
+                            i += 2;
+                            // Find the closing $$
+                            while i + 1 < bytes.len() {
+                                if bytes[i] == b'$' && bytes[i + 1] == b'$' {
+                                    i += 2;
+                                    // Skip any trailing semicolon
+                                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                                        i += 1;
+                                    }
+                                    if i < bytes.len() && bytes[i] == b';' {
+                                        i += 1;
+                                    }
+                                    return Some(i);
+                                }
+                                i += 1;
+                            }
+                            // If we didn't find closing $$, return None
+                            return None;
+                        }
                         continue;
                     }
                 }
             }
             
-            if in_as_clause && state == ParseState::Normal {
+            if in_as_clause && state == ParseState::Normal && !in_dollar_block {
                 // Look for BEGIN/DECLARE after AS
                 if i + 5 <= bytes.len() {
                     let chunk = &text[i..i+5];
@@ -1418,7 +1447,7 @@ impl Workspace {
             i = next;
         }
         
-        if !found_as || begin_count == 0 {
+        if !found_as || (begin_count == 0 && !in_dollar_block) {
             return None;
         }
         
@@ -1624,6 +1653,17 @@ impl Workspace {
         None
     }
 
+    /// Check if a DDL uses $$ delimiters
+    fn uses_dollar_delimiter(text: &str) -> bool {
+        let trimmed = text.trim();
+        if let Some(as_pos) = trimmed.find(" AS ") {
+            let after_as = trimmed[as_pos + 4..].trim();
+            after_as.starts_with("$$")
+        } else {
+            false
+        }
+    }
+
     /// Enhanced should_wrap_statement that knows not to wrap DDL statements
     fn should_wrap_statement(stmt: &str) -> bool {
         // User can disable wrapping with a comment
@@ -1633,7 +1673,12 @@ impl Workspace {
         
         let trimmed = stmt.trim().to_uppercase();
         
-        // Never wrap DDL statements (they contain their own blocks)
+        // Check if it's a DDL with $$ delimiters - these need wrapping
+        if Self::is_block_containing_ddl(stmt) && Self::uses_dollar_delimiter(stmt) {
+            return true;
+        }
+        
+        // Never wrap DDL statements with BEGIN/END blocks (they work as-is)
         if Self::is_block_containing_ddl(stmt) {
             return false;
         }
@@ -1648,19 +1693,11 @@ impl Workspace {
             return true;
         }
         
+        // Wrap all standalone BEGIN/END blocks
+        // (Those that are not part of a CREATE PROCEDURE/FUNCTION/etc)
         if trimmed.starts_with("BEGIN") && !trimmed.contains("TRANSACTION") {
-            // But check if it's a simple BEGIN/END with just session variables
-            // These work fine without wrapping
-            if !stmt.to_uppercase().contains(" LET ") && 
-               !stmt.to_uppercase().contains(" CURSOR ") &&
-               !stmt.to_uppercase().contains(" EXCEPTION ") {
-                // Might be a simple SET/SELECT block, check if it uses := assignment
-                if stmt.contains(":=") {
-                    return true; // Needs wrapping for := syntax
-                }
-                // Otherwise, let it through without wrapping
-                return false;
-            }
+            // This is a standalone BEGIN block, not part of a DDL
+            // These always need wrapping in Snowflake
             return true;
         }
         
@@ -2536,8 +2573,20 @@ pub fn render<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
             return Ok(());                                    // bail out early
         }
 
+        // Wrap queries that need it
+        let wrapped_queries: Vec<String> = queries
+            .into_iter()
+            .map(|q| {
+                if Self::should_wrap_statement(&q) {
+                    format!("EXECUTE IMMEDIATE $$\n{}\n$$;", q.trim_end_matches(';'))
+                } else {
+                    q
+                }
+            })
+            .collect();
+
         // Extract contexts for each query
-        let queries_with_context: Vec<(String, String)> = queries
+        let queries_with_context: Vec<(String, String)> = wrapped_queries
             .into_iter()
             .map(|q| {
                 let context = Self::extract_query_context(&q);
