@@ -1260,7 +1260,10 @@ pub fn render<B: Backend>(
     if results.tabs.is_empty() {
         let p = Paragraph::new("No results")
             .block(Block::default()
-                .title("Results")
+                .title(Span::styled(
+                    "Results",
+                    STYLE::results_border_focus()  // Always use active color for title text
+                ))
                 .borders(Borders::ALL)
                 .border_style(
                             if results.focus {
@@ -1305,7 +1308,10 @@ pub fn render<B: Backend>(
                 let p = Paragraph::new("No rows returned (this statement did not produce a table)")
                     .block(
                     Block::default()
-                        .title(border_label)
+                        .title(Span::styled(
+                            border_label,
+                            STYLE::results_border_focus()  // Always use active color for title text
+                        ))
                         .borders(Borders::ALL)
                         .border_style(
                             if results.focus {
@@ -1396,7 +1402,10 @@ pub fn render<B: Backend>(
             
             // Draw the border first
             let block = Block::default()
-                .title(border_label)
+                .title(Span::styled(
+                    border_label,
+                    STYLE::results_border_focus()  // Always use active color for title text
+                ))
                 .borders(Borders::ALL)
                 .border_style(res_border);
             f.render_widget(block, table_area);
@@ -1671,7 +1680,10 @@ pub fn render<B: Backend>(
             
             let p = Paragraph::new(lines)
                 .block(Block::default()
-                    .title(border_label)
+                    .title(Span::styled(
+                        border_label,
+                        STYLE::results_border_focus()  // Always use active color for title text
+                    ))
                     .borders(Borders::ALL)
                     .border_style(if results.focus {
                         STYLE::results_border_focus()
@@ -1690,7 +1702,17 @@ pub fn render<B: Backend>(
         }
         ResultsContent::Info { message } => {
             let p = Paragraph::new(message.as_str())
-                .block(Block::default().title(border_label).borders(Borders::ALL))
+                .block(Block::default()
+                    .title(Span::styled(
+                        border_label,
+                        STYLE::results_border_focus()  // Always use active color for title text
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(if results.focus {
+                        STYLE::results_border_focus()
+                    } else {
+                        STYLE::results_border()
+                    }))
                 .style(STYLE::info_fg());
             f.render_widget(
                 p,
@@ -1704,7 +1726,17 @@ pub fn render<B: Backend>(
         }
         ResultsContent::Pending => {
             let p = Paragraph::new("")
-                .block(Block::default().title(border_label).borders(Borders::ALL).border_style(STYLE::results_border()));
+                .block(Block::default()
+                    .title(Span::styled(
+                        border_label,
+                        STYLE::results_border_focus()  // Always use active color for title text
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(if results.focus {
+                        STYLE::results_border_focus()
+                    } else {
+                        STYLE::results_border()
+                    }));
             f.render_widget(
                 p,
                 UiRect {

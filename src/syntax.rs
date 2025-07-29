@@ -1,5 +1,3 @@
-
-
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{borrow::Cow, collections::HashSet};
@@ -39,7 +37,7 @@ static KEYWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
 /*──── compact regex for tokenising a single line ─────────────────*/
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"::|:[A-Za-z_][A-Za-z0-9_$]*|@@?[A-Za-z_][A-Za-z0-9_$]*|\$[A-Za-z_][A-Za-z0-9_$]*|--[^\r\n]*|/\*|\*/|'(?:[^'\\]|\\.|'')*'?|"(?:[^"\\]|\\.|"")*"?|\b[0-9]+(?:\.[0-9]+)?|\b[A-Za-z_][A-Za-z0-9_$]*|\s+|."#
+        r#"(\$\$)|::|:[A-Za-z_][A-Za-z0-9_$]*|@@?[A-Za-z_][A-Za-z0-9_$]*|\$[A-Za-z_][A-Za-z0-9_$]*|--[^\r\n]*|/\*|\*/|'(?:[^'\\]|\\.|'')*'?|"(?:[^"\\]|\\.|"")*"?|\b[0-9]+(?:\.[0-9]+)?|\b[A-Za-z_][A-Za-z0-9_$]*|\s+|."#
     ).unwrap()
 });
 
@@ -51,6 +49,7 @@ pub enum ParseState {
     InDouble,   // inside "…"
     InBlock,    // inside /* … */
     InLine,     // inside -- … to end-of-line
+    InDollar,   // inside $$…$$
 }
 
 /*──── one-byte scanner result codes (splitter & caret use these) ─*/
@@ -102,6 +101,16 @@ pub fn highlight_line<'a>(line: &'a str, state: &mut ParseState) -> Vec<Seg<'a>>
             *state = ParseState::Normal;
             return segs;
         }
+        ParseState::InDollar => {
+            if let Some(pos) = line[start..].find("$$") {
+                segs.push((Cow::Borrowed(&line[..start + pos + 2]), str_()));
+                *state = ParseState::Normal;
+                start += pos + 2;
+            } else {
+                segs.push((Cow::Borrowed(&line[start..]), str_()));
+                return segs;
+            }
+        }
         ParseState::Normal => {}
     }
 
@@ -119,6 +128,14 @@ pub fn highlight_line<'a>(line: &'a str, state: &mut ParseState) -> Vec<Seg<'a>>
         if tok.starts_with("--") {
             segs.push((Cow::Borrowed(tok), cmt()));
             break;                              // rest of row is comment
+        }
+
+        /* dollar-quoted string $$ ... $$ */
+        if tok == "$$" {
+            segs.push((Cow::Borrowed(tok), str_()));
+            *state = ParseState::InDollar;
+            idx += 1;
+            continue;
         }
 
         /* cast  :: ident */
@@ -209,6 +226,7 @@ pub fn step(bytes: &[u8], mut i: usize, state: &mut ParseState) -> (usize, Step)
             b'"'                                  => { *state = ParseState::InDouble; next!(); }
             b'/' if bytes.get(i+1) == Some(&b'*') => { *state = ParseState::InBlock;  i += 2; }
             b'-' if bytes.get(i+1) == Some(&b'-') => { *state = ParseState::InLine;   i += 2; }
+            b'$' if bytes.get(i+1) == Some(&b'$') => { *state = ParseState::InDollar; i += 2; }
             b';'                                  => { next!(); return (i, Step::Semi); }
             _                                     => { next!(); }
         },
@@ -256,6 +274,14 @@ pub fn step(bytes: &[u8], mut i: usize, state: &mut ParseState) -> (usize, Step)
         ParseState::InLine => {
             next!();
             if bytes[i - 1] == b'\n' { *state = ParseState::Normal; }
+        }
+
+        /*—— inside $$…$$ ———————————————————————————*/
+        ParseState::InDollar => {
+            next!();
+            if bytes[i - 1] == b'$' && bytes.get(i) == Some(&b'$') {
+                *state = ParseState::Normal; next!();
+            }
         }
     }
     (i, Step::Advance)
